@@ -13,23 +13,20 @@ from flask import Flask
 
 app = Flask(__name__)
 
-# Render Environment Variables
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-INITIAL_SECRET_CODE = os.environ.get("SECRET_CODE", "JAHID2026").strip()
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+SECRET_CODE = os.getenv("SECRET_CODE", "JAHID2026").strip()
 
 ADMIN_ID = 7454180235
-secret_code = INITIAL_SECRET_CODE
+API = f"https://api.telegram.org/bot{TOKEN}"
 
-API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+authorized_users = {ADMIN_ID}
+current_secret = SECRET_CODE
 
-# Runtime-এ অনুমোদিত ইউজার
-authorized_users = set()
-
-# একই সময়ে বেশি ডাউনলোড চালু না করার জন্য
-download_lock = threading.Semaphore(2)
+# একই সময়ে সর্বোচ্চ 2টি ডাউনলোড
+download_limit = threading.Semaphore(2)
 
 
-def telegram(method, data=None, files=None, timeout=120):
+def tg(method, data=None, files=None, timeout=1800):
     try:
         response = requests.post(
             f"{API}/{method}",
@@ -38,11 +35,11 @@ def telegram(method, data=None, files=None, timeout=120):
             timeout=timeout
         )
 
-        print(method, response.status_code, response.text[:500])
+        print(method, response.status_code, response.text[:1000])
         return response.json()
 
     except Exception as error:
-        print("Telegram API Error:", error)
+        print("Telegram error:", error)
         return {}
 
 
@@ -55,27 +52,34 @@ def send_message(chat_id, text, reply_to=None):
     if reply_to:
         data["reply_to_message_id"] = reply_to
 
-    result = telegram("sendMessage", data)
+    result = tg("sendMessage", data)
 
     return result.get("result", {}).get("message_id")
 
 
-def delete_message(chat_id, message_id):
-    if message_id:
-        telegram(
-            "deleteMessage",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id
-            }
-        )
+def delete_message_later(chat_id, message_id, seconds=10):
+    def worker():
+        time.sleep(seconds)
+
+        if message_id:
+            tg(
+                "deleteMessage",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id
+                }
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
-def is_authorized(user_id):
-    return user_id == ADMIN_ID or user_id in authorized_users
+def temporary_message(chat_id, text, reply_to=None, seconds=10):
+    message_id = send_message(chat_id, text, reply_to)
+    delete_message_later(chat_id, message_id, seconds)
+    return message_id
 
 
-def extract_url(text):
+def get_url(text):
     if not text:
         return None
 
@@ -87,16 +91,16 @@ def extract_url(text):
     return match.group(0).rstrip(".,!?)]}>\"'")
 
 
-def is_supported_url(url):
+def supported_url(url):
     try:
-        hostname = urlparse(url).hostname
+        host = urlparse(url).hostname
 
-        if not hostname:
+        if not host:
             return False
 
-        hostname = hostname.lower().replace("www.", "")
+        host = host.lower().replace("www.", "")
 
-        supported_domains = [
+        domains = [
             "tiktok.com",
             "tiktokcdn.com",
             "facebook.com",
@@ -106,62 +110,47 @@ def is_supported_url(url):
             "x.com",
             "youtube.com",
             "youtu.be",
+            "google.com",
             "vidmard.com",
-            "vidmard.net",
-            "google.com"
+            "vidmard.net"
         ]
 
         return any(
-            hostname == domain or hostname.endswith("." + domain)
-            for domain in supported_domains
+            host == domain or host.endswith("." + domain)
+            for domain in domains
         )
 
     except Exception:
         return False
 
 
-def start_message(name):
-    return (
-        f"👋 আসসালামু আলাইকুম, {name} স্যার!\n\n"
-        "📥 Supported Platforms:\n\n"
-        "🎵 TikTok\n"
-        "🎵 TikTok Lite\n"
-        "📘 Facebook\n"
-        "📘 Facebook Lite\n"
-        "📹 Vidmard\n"
-        "▶️ YouTube\n"
-        "🌐 Chrome\n"
-        "🔎 Google\n"
-        "🔞 18+ Video\n"
-        "🐦 Twitter / X\n"
-        "📸 Instagram\n"
-        "📸 Instagram Lite\n\n"
-        "🔗 শুধু ভিডিও লিংক পাঠান\n"
-        "🎬 আমি ভিডিও ডাউনলোড করে দিব\n\n"
-        "👨‍💻 Admin: @JAHIDVAI12"
-    )
-
-
 def download_video(url):
-    temp_dir = tempfile.mkdtemp(prefix="download_")
+    folder = tempfile.mkdtemp(prefix="video_")
 
-    output_template = os.path.join(
-        temp_dir,
+    output = os.path.join(
+        folder,
         "%(title).80s.%(ext)s"
     )
 
     command = [
         "yt-dlp",
         "--no-playlist",
+        "--no-warnings",
         "--restrict-filenames",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--socket-timeout",
+        "30",
         "--max-filesize",
         "2G",
         "-f",
-        "bv*+ba/b",
+        "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
         "--merge-output-format",
         "mp4",
         "-o",
-        output_template,
+        output,
         url
     ]
 
@@ -173,291 +162,338 @@ def download_video(url):
             timeout=1800
         )
 
-        print("Downloader output:", result.stdout[-2000:])
-        print("Downloader error:", result.stderr[-2000:])
+        print("YT-DLP OUTPUT:")
+        print(result.stdout[-4000:])
+
+        print("YT-DLP ERROR:")
+        print(result.stderr[-4000:])
 
         if result.returncode != 0:
-            return None, temp_dir
+            return None, folder
 
-        allowed_extensions = [
+        extensions = [
             ".mp4",
             ".mkv",
             ".webm",
-            ".mov"
+            ".mov",
+            ".avi"
         ]
 
-        video_files = [
-            file for file in Path(temp_dir).glob("*")
+        files = [
+            file for file in Path(folder).glob("*")
             if file.is_file()
-            and file.suffix.lower() in allowed_extensions
+            and file.suffix.lower() in extensions
         ]
 
-        if not video_files:
-            return None, temp_dir
+        if not files:
+            return None, folder
 
-        # সবচেয়ে বড় ভিডিও ফাইলটি নির্বাচন
-        video_files.sort(
-            key=lambda file: file.stat().st_size,
+        files.sort(
+            key=lambda item: item.stat().st_size,
             reverse=True
         )
 
-        return str(video_files[0]), temp_dir
+        return str(files[0]), folder
+
+    except subprocess.TimeoutExpired:
+        print("Download timeout")
+        return None, folder
 
     except Exception as error:
-        print("Download error:", error)
-        return None, temp_dir
+        print("Download exception:", error)
+        return None, folder
 
 
-def send_downloaded_video(chat_id, original_message_id, video_path):
-    try:
-        file_size = os.path.getsize(video_path)
-        size_mb = round(file_size / (1024 * 1024), 2)
+def send_video_or_document(chat_id, reply_to, file_path):
+    size = os.path.getsize(file_path)
+    size_mb = round(size / (1024 * 1024), 2)
 
-        with open(video_path, "rb") as video_file:
-            result = telegram(
-                "sendVideo",
-                data={
-                    "chat_id": chat_id,
-                    "reply_to_message_id": original_message_id,
-                    "caption": f"🎬 ভিডিও ডাউনলোড সম্পন্ন হয়েছে!\n📦 সাইজ: {size_mb} MB",
-                    "supports_streaming": "true"
-                },
-                files={
-                    "video": video_file
-                },
-                timeout=1800
-            )
-
-        return result.get("ok", False), size_mb
-
-    except Exception as error:
-        print("Send video error:", error)
-        return False, 0
-
-
-def process_video(chat_id, original_message_id, url, status_message_id):
-    with download_lock:
-
-        # ৫ সেকেন্ড পরে Downloading মেসেজ ডিলিট
-        def remove_status():
-            time.sleep(5)
-            delete_message(chat_id, status_message_id)
-
-        threading.Thread(
-            target=remove_status,
-            daemon=True
-        ).start()
-
-        send_message(
-            chat_id,
-            "📥 ভিডিও ডাউনলোড শুরু হয়েছে। বড় ভিডিও হলে সময় বেশি লাগতে পারে।",
-            original_message_id
+    # ৫০ MB বা তার বেশি হলে Document হিসেবে পাঠানোর চেষ্টা
+    if size_mb >= 50:
+        method = "sendDocument"
+        file_key = "document"
+        caption = (
+            "📦 বড় ভিডিও ডকুমেন্ট হিসেবে পাঠানো হয়েছে\n"
+            f"📏 সাইজ: {size_mb} MB"
+        )
+    else:
+        method = "sendVideo"
+        file_key = "video"
+        caption = (
+            "🎬 ভিডিও ডাউনলোড সম্পন্ন\n"
+            f"📏 সাইজ: {size_mb} MB"
         )
 
-        video_path, temp_dir = download_video(url)
+    with open(file_path, "rb") as video_file:
+        result = tg(
+            method,
+            data={
+                "chat_id": chat_id,
+                "reply_to_message_id": reply_to,
+                "caption": caption,
+                "supports_streaming": "true"
+            },
+            files={
+                file_key: video_file
+            },
+            timeout=1800
+        )
 
-        if not video_path:
-            send_message(
+    return result.get("ok", False), size_mb
+
+
+def process_download(chat_id, original_message_id, url, status_id):
+    with download_limit:
+
+        # Downloading মেসেজ ৫ সেকেন্ড পরে ডিলিট
+        delete_message_later(
+            chat_id,
+            status_id,
+            seconds=5
+        )
+
+        temporary_message(
+            chat_id,
+            "📥 ভিডিও ডাউনলোড হচ্ছে। বড় ভিডিও হলে সময় লাগতে পারে।",
+            original_message_id,
+            seconds=10
+        )
+
+        file_path, folder = download_video(url)
+
+        if not file_path:
+            temporary_message(
                 chat_id,
                 "❌ ভিডিও ডাউনলোড করা যায়নি।\n\n"
-                "সম্ভবত ভিডিওটি private, login-required, "
-                "unsupported অথবা সাইটটি ডাউনলোড বন্ধ করেছে।",
-                original_message_id
+                "সম্ভাব্য কারণ:\n"
+                "• লিংক private বা login-required\n"
+                "• ভিডিওটি সাইট থেকে সরানো হয়েছে\n"
+                "• সাইটটি ডাউনলোড বন্ধ করেছে\n"
+                "• লিংকটি yt-dlp সাপোর্ট করছে না",
+                original_message_id,
+                seconds=15
             )
-            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            shutil.rmtree(folder, ignore_errors=True)
             return
 
         try:
-            success, size_mb = send_downloaded_video(
+            success, size_mb = send_video_or_document(
                 chat_id,
                 original_message_id,
-                video_path
+                file_path
             )
 
             if not success:
-                send_message(
+                temporary_message(
                     chat_id,
-                    f"📥 ভিডিও ডাউনলোড হয়েছে।\n"
-                    f"📦 সাইজ: {size_mb} MB\n\n"
-                    "⚠️ ভিডিওটি Telegram-এ সরাসরি পাঠানো যায়নি। "
-                    "ফাইলটি খুব বড় হতে পারে।",
-                    original_message_id
+                    f"❌ Telegram ভিডিওটি পাঠাতে পারেনি।\n"
+                    f"📏 ফাইল সাইজ: {size_mb} MB\n\n"
+                    "৫০ MB-এর বেশি ফাইল অফিসিয়াল Telegram Bot API-তে "
+                    "পাঠানো নাও যেতে পারে।",
+                    original_message_id,
+                    seconds=15
                 )
 
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def handle_message(message):
-    global secret_code
+    global current_secret
 
     if not message:
         return
 
     chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
+
     user = message.get("from", {})
     user_id = user.get("id")
     first_name = user.get("first_name", "User")
+
     text = message.get("text", "").strip()
-    message_id = message["message_id"]
 
     if not text:
         return
 
-    # /start
+    # Start
     if text.startswith("/start"):
-        if is_authorized(user_id):
+        if user_id in authorized_users or user_id == ADMIN_ID:
             send_message(
                 chat_id,
-                start_message(first_name)
+                f"👋 আসসালামু আলাইকুম, {first_name} স্যার!\n\n"
+                "📥 Supported:\n"
+                "🎵 TikTok / TikTok Lite\n"
+                "📘 Facebook / Facebook Lite\n"
+                "📹 Vidmard\n"
+                "▶️ YouTube\n"
+                "🐦 Twitter / X\n"
+                "📸 Instagram / Instagram Lite\n"
+                "🔗 শুধু ভিডিও লিংক পাঠান\n"
+                "🎬 আমি ভিডিও ডাউনলোড করে দিব\n\n"
+                "👨‍💻 Admin: @JAHIDVAI12"
             )
         else:
-            send_message(
+            temporary_message(
                 chat_id,
-                "🔐 এই বট ব্যবহার করতে Secret Code দিন।"
+                "🔐 বট ব্যবহার করতে Secret Code দিন।",
+                seconds=10
             )
 
         return
 
-    # Admin: Secret Code পরিবর্তন
+    # Secret code পরিবর্তন
     if text.startswith("/setcode"):
         if user_id != ADMIN_ID:
-            send_message(
+            temporary_message(
                 chat_id,
-                "❌ এই কমান্ড শুধু Admin ব্যবহার করতে পারবেন।"
+                "❌ শুধু Admin এই কমান্ড ব্যবহার করতে পারবেন।",
+                seconds=10
             )
             return
 
         parts = text.split(maxsplit=1)
 
         if len(parts) != 2 or len(parts[1].strip()) < 4:
-            send_message(
+            temporary_message(
                 chat_id,
-                "ব্যবহার করুন:\n/setcode নতুনকোড"
+                "ব্যবহার করুন:\n/setcode নতুনকোড",
+                seconds=10
             )
             return
 
-        secret_code = parts[1].strip()
+        current_secret = parts[1].strip()
 
-        send_message(
+        temporary_message(
             chat_id,
-            "✅ Secret Code পরিবর্তন হয়েছে।"
+            "✅ Secret Code পরিবর্তন হয়েছে।",
+            seconds=10
         )
         return
 
-    # Admin: User অনুমোদন
+    # User add
     if text.startswith("/adduser"):
         if user_id != ADMIN_ID:
-            send_message(
+            temporary_message(
                 chat_id,
-                "❌ শুধু Admin এই কমান্ড ব্যবহার করতে পারবেন।"
+                "❌ শুধু Admin এই কমান্ড ব্যবহার করতে পারবেন।",
+                seconds=10
             )
             return
 
         parts = text.split(maxsplit=1)
 
         if len(parts) != 2 or not parts[1].isdigit():
-            send_message(
+            temporary_message(
                 chat_id,
-                "ব্যবহার করুন:\n/adduser USER_ID"
+                "ব্যবহার করুন:\n/adduser USER_ID",
+                seconds=10
             )
             return
 
-        new_user_id = int(parts[1])
-        authorized_users.add(new_user_id)
+        new_id = int(parts[1])
+        authorized_users.add(new_id)
 
-        send_message(
+        temporary_message(
             chat_id,
-            f"✅ User অনুমোদিত হয়েছে:\n{new_user_id}"
+            f"✅ User অনুমোদিত হয়েছে: {new_id}",
+            seconds=10
         )
         return
 
-    # Admin: User বাদ দেওয়া
+    # User remove
     if text.startswith("/removeuser"):
         if user_id != ADMIN_ID:
-            send_message(
+            temporary_message(
                 chat_id,
-                "❌ শুধু Admin এই কমান্ড ব্যবহার করতে পারবেন।"
+                "❌ শুধু Admin এই কমান্ড ব্যবহার করতে পারবেন।",
+                seconds=10
             )
             return
 
         parts = text.split(maxsplit=1)
 
         if len(parts) != 2 or not parts[1].isdigit():
-            send_message(
+            temporary_message(
                 chat_id,
-                "ব্যবহার করুন:\n/removeuser USER_ID"
+                "ব্যবহার করুন:\n/removeuser USER_ID",
+                seconds=10
             )
             return
 
         remove_id = int(parts[1])
         authorized_users.discard(remove_id)
 
-        send_message(
+        temporary_message(
             chat_id,
-            f"✅ User-এর অনুমতি বাতিল হয়েছে:\n{remove_id}"
+            f"✅ User-এর অনুমতি বাতিল হয়েছে: {remove_id}",
+            seconds=10
         )
         return
 
-    # Secret Code যাচাই
-    if not is_authorized(user_id):
-        if text == secret_code:
+    # Authorization
+    if user_id not in authorized_users and user_id != ADMIN_ID:
+        if text == current_secret:
             authorized_users.add(user_id)
 
-            send_message(
+            temporary_message(
                 chat_id,
-                "✅ Access Granted!\n\n"
-                "🔗 এখন ভিডিও লিংক পাঠান।"
+                "✅ Access Granted!\n\nএখন ভিডিও লিংক পাঠান।",
+                seconds=10
             )
         else:
-            send_message(
+            temporary_message(
                 chat_id,
-                "❌ Secret Code ভুল।\n"
-                "Admin-এর কাছ থেকে সঠিক কোড নিন।"
+                "❌ Secret Code ভুল।",
+                seconds=10
             )
 
         return
 
-    # URL বের করা
-    url = extract_url(text)
+    # Link
+    url = get_url(text)
 
     if not url:
-        send_message(
+        temporary_message(
             chat_id,
-            "🔗 অনুগ্রহ করে একটি ভিডিও লিংক পাঠান।"
+            "🔗 অনুগ্রহ করে ভিডিও লিংক পাঠান।",
+            seconds=10
         )
         return
 
-    if not is_supported_url(url):
-        send_message(
+    if not supported_url(url):
+        temporary_message(
             chat_id,
-            "❌ এই লিংকটি এখনো সাপোর্ট করা হচ্ছে না।"
+            "❌ এই লিংকটি সাপোর্ট করা হচ্ছে না।",
+            message_id,
+            seconds=10
         )
         return
 
-    status_message_id = send_message(
+    status_id = send_message(
         chat_id,
         "⏳ Downloading Video...",
         message_id
     )
 
     threading.Thread(
-        target=process_video,
+        target=process_download,
         args=(
             chat_id,
             message_id,
             url,
-            status_message_id
+            status_id
         ),
         daemon=True
     ).start()
 
 
-def polling_loop():
+def polling():
     print("Polling started...")
 
-    # পুরোনো Webhook মুছে দেবে
-    telegram(
+    # পুরোনো webhook মুছে ফেলা
+    tg(
         "deleteWebhook",
         {
             "drop_pending_updates": "true"
@@ -485,7 +521,7 @@ def polling_loop():
             data = response.json()
 
             if not data.get("ok"):
-                print("Polling response:", data)
+                print("GetUpdates error:", data)
                 time.sleep(5)
                 continue
 
@@ -514,15 +550,14 @@ def health():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-
-    # Polling আলাদা থ্রেডে চালু
     threading.Thread(
-        target=polling_loop,
+        target=polling,
         daemon=True
     ).start()
+
+    port = int(os.getenv("PORT", "10000"))
 
     app.run(
         host="0.0.0.0",
         port=port
-    )
+            )
