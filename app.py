@@ -15,14 +15,12 @@ app = Flask(__name__)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 SECRET_CODE = os.getenv("SECRET_CODE", "JAHID2026").strip()
-
 ADMIN_ID = 7454180235
+
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 authorized_users = {ADMIN_ID}
 current_secret = SECRET_CODE
-
-# একই সময়ে সর্বোচ্চ 2টি ডাউনলোড
 download_limit = threading.Semaphore(2)
 
 
@@ -34,30 +32,24 @@ def tg(method, data=None, files=None, timeout=1800):
             files=files,
             timeout=timeout
         )
-
         print(method, response.status_code, response.text[:1000])
         return response.json()
-
     except Exception as error:
         print("Telegram error:", error)
         return {}
 
 
 def send_message(chat_id, text, reply_to=None):
-    data = {
-        "chat_id": chat_id,
-        "text": text
-    }
+    data = {"chat_id": chat_id, "text": text}
 
     if reply_to:
         data["reply_to_message_id"] = reply_to
 
     result = tg("sendMessage", data)
-
     return result.get("result", {}).get("message_id")
 
 
-def delete_message_later(chat_id, message_id, seconds=10):
+def delete_later(chat_id, message_id, seconds=5):
     def worker():
         time.sleep(seconds)
 
@@ -75,15 +67,12 @@ def delete_message_later(chat_id, message_id, seconds=10):
 
 def temporary_message(chat_id, text, reply_to=None, seconds=10):
     message_id = send_message(chat_id, text, reply_to)
-    delete_message_later(chat_id, message_id, seconds)
+    delete_later(chat_id, message_id, seconds)
     return message_id
 
 
-def get_url(text):
-    if not text:
-        return None
-
-    match = re.search(r"https?://[^\s]+", text)
+def extract_url(text):
+    match = re.search(r"https?://[^\s]+", text or "")
 
     if not match:
         return None
@@ -101,16 +90,14 @@ def supported_url(url):
         host = host.lower().replace("www.", "")
 
         domains = [
+            "youtube.com",
+            "youtu.be",
             "tiktok.com",
-            "tiktokcdn.com",
             "facebook.com",
             "fb.watch",
             "instagram.com",
             "twitter.com",
             "x.com",
-            "youtube.com",
-            "youtu.be",
-            "google.com",
             "vidmard.com",
             "vidmard.net"
         ]
@@ -126,31 +113,29 @@ def supported_url(url):
 
 def download_video(url):
     folder = tempfile.mkdtemp(prefix="video_")
+    output = os.path.join(folder, "%(title).80s.%(ext)s")
 
-    output = os.path.join(
-        folder,
-        "%(title).80s.%(ext)s"
+    # YouTube: 720p → 480p → 360p → available best
+    format_selector = (
+        "bestvideo[height<=720]+bestaudio/"
+        "best[height<=720]/"
+        "bestvideo[height<=480]+bestaudio/"
+        "best[height<=480]/"
+        "bestvideo[height<=360]+bestaudio/"
+        "best[height<=360]/best"
     )
 
     command = [
         "yt-dlp",
         "--no-playlist",
-        "--no-warnings",
         "--restrict-filenames",
-        "--retries",
-        "3",
-        "--fragment-retries",
-        "3",
-        "--socket-timeout",
-        "30",
-        "--max-filesize",
-        "2G",
-        "-f",
-        "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        output,
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "--socket-timeout", "30",
+        "--max-filesize", "2G",
+        "-f", format_selector,
+        "--merge-output-format", "mp4",
+        "-o", output,
         url
     ]
 
@@ -171,13 +156,7 @@ def download_video(url):
         if result.returncode != 0:
             return None, folder
 
-        extensions = [
-            ".mp4",
-            ".mkv",
-            ".webm",
-            ".mov",
-            ".avi"
-        ]
+        extensions = [".mp4", ".mkv", ".webm", ".mov"]
 
         files = [
             file for file in Path(folder).glob("*")
@@ -189,52 +168,42 @@ def download_video(url):
             return None, folder
 
         files.sort(
-            key=lambda item: item.stat().st_size,
+            key=lambda file: file.stat().st_size,
             reverse=True
         )
 
         return str(files[0]), folder
 
-    except subprocess.TimeoutExpired:
-        print("Download timeout")
-        return None, folder
-
     except Exception as error:
-        print("Download exception:", error)
+        print("Download error:", error)
         return None, folder
 
 
 def send_video_or_document(chat_id, reply_to, file_path):
-    size = os.path.getsize(file_path)
-    size_mb = round(size / (1024 * 1024), 2)
+    file_size = os.path.getsize(file_path)
+    size_mb = round(file_size / (1024 * 1024), 2)
 
-    # ৫০ MB বা তার বেশি হলে Document হিসেবে পাঠানোর চেষ্টা
-    if size_mb >= 50:
-        method = "sendDocument"
-        file_key = "document"
-        caption = (
-            "📦 বড় ভিডিও ডকুমেন্ট হিসেবে পাঠানো হয়েছে\n"
-            f"📏 সাইজ: {size_mb} MB"
-        )
-    else:
+    if file_size <= 49 * 1024 * 1024:
         method = "sendVideo"
         file_key = "video"
-        caption = (
-            "🎬 ভিডিও ডাউনলোড সম্পন্ন\n"
-            f"📏 সাইজ: {size_mb} MB"
-        )
+    else:
+        method = "sendDocument"
+        file_key = "document"
 
-    with open(file_path, "rb") as video_file:
+    with open(file_path, "rb") as file:
         result = tg(
             method,
             data={
                 "chat_id": chat_id,
                 "reply_to_message_id": reply_to,
-                "caption": caption,
+                "caption": (
+                    f"🎬 ভিডিও ডাউনলোড সম্পন্ন!\n"
+                    f"📦 সাইজ: {size_mb} MB"
+                ),
                 "supports_streaming": "true"
             },
             files={
-                file_key: video_file
+                file_key: file
             },
             timeout=1800
         )
@@ -244,20 +213,7 @@ def send_video_or_document(chat_id, reply_to, file_path):
 
 def process_download(chat_id, original_message_id, url, status_id):
     with download_limit:
-
-        # Downloading মেসেজ ৫ সেকেন্ড পরে ডিলিট
-        delete_message_later(
-            chat_id,
-            status_id,
-            seconds=5
-        )
-
-        temporary_message(
-            chat_id,
-            "📥 ভিডিও ডাউনলোড হচ্ছে। বড় ভিডিও হলে সময় লাগতে পারে।",
-            original_message_id,
-            seconds=10
-        )
+        delete_later(chat_id, status_id, 5)
 
         file_path, folder = download_video(url)
 
@@ -265,15 +221,11 @@ def process_download(chat_id, original_message_id, url, status_id):
             temporary_message(
                 chat_id,
                 "❌ ভিডিও ডাউনলোড করা যায়নি।\n\n"
-                "সম্ভাব্য কারণ:\n"
-                "• লিংক private বা login-required\n"
-                "• ভিডিওটি সাইট থেকে সরানো হয়েছে\n"
-                "• সাইটটি ডাউনলোড বন্ধ করেছে\n"
-                "• লিংকটি yt-dlp সাপোর্ট করছে না",
+                "ভিডিওটি private, login-required, removed "
+                "অথবা unsupported হতে পারে।",
                 original_message_id,
-                seconds=15
+                15
             )
-
             shutil.rmtree(folder, ignore_errors=True)
             return
 
@@ -287,12 +239,12 @@ def process_download(chat_id, original_message_id, url, status_id):
             if not success:
                 temporary_message(
                     chat_id,
-                    f"❌ Telegram ভিডিওটি পাঠাতে পারেনি।\n"
-                    f"📏 ফাইল সাইজ: {size_mb} MB\n\n"
-                    "৫০ MB-এর বেশি ফাইল অফিসিয়াল Telegram Bot API-তে "
-                    "পাঠানো নাও যেতে পারে।",
+                    f"❌ ভিডিও পাঠানো যায়নি।\n"
+                    f"📦 সাইজ: {size_mb} MB\n\n"
+                    "Telegram-এর ফাইল সীমার কারণে বড় ফাইল "
+                    "পাঠানো সম্ভব নাও হতে পারে।",
                     original_message_id,
-                    seconds=15
+                    15
                 )
 
         finally:
@@ -311,13 +263,11 @@ def handle_message(message):
     user = message.get("from", {})
     user_id = user.get("id")
     first_name = user.get("first_name", "User")
-
     text = message.get("text", "").strip()
 
     if not text:
         return
 
-    # Start
     if text.startswith("/start"):
         if user_id in authorized_users or user_id == ADMIN_ID:
             send_message(
@@ -329,21 +279,20 @@ def handle_message(message):
                 "📹 Vidmard\n"
                 "▶️ YouTube\n"
                 "🐦 Twitter / X\n"
-                "📸 Instagram / Instagram Lite\n"
-                "🔗 শুধু ভিডিও লিংক পাঠান\n"
-                "🎬 আমি ভিডিও ডাউনলোড করে দিব\n\n"
+                "📸 Instagram / Instagram Lite\n\n"
+                "🎬 YouTube Quality:\n"
+                "720p → 480p → 360p\n\n"
+                "🔗 শুধু পাবলিক ভিডিও লিংক পাঠান\n"
                 "👨‍💻 Admin: @JAHIDVAI12"
             )
         else:
             temporary_message(
                 chat_id,
-                "🔐 বট ব্যবহার করতে Secret Code দিন।",
+                "🔐 এই বট ব্যবহার করতে Secret Code দিন।",
                 seconds=10
             )
-
         return
 
-    # Secret code পরিবর্তন
     if text.startswith("/setcode"):
         if user_id != ADMIN_ID:
             temporary_message(
@@ -372,7 +321,6 @@ def handle_message(message):
         )
         return
 
-    # User add
     if text.startswith("/adduser"):
         if user_id != ADMIN_ID:
             temporary_message(
@@ -392,17 +340,15 @@ def handle_message(message):
             )
             return
 
-        new_id = int(parts[1])
-        authorized_users.add(new_id)
+        authorized_users.add(int(parts[1]))
 
         temporary_message(
             chat_id,
-            f"✅ User অনুমোদিত হয়েছে: {new_id}",
+            "✅ User অনুমোদিত হয়েছে।",
             seconds=10
         )
         return
 
-    # User remove
     if text.startswith("/removeuser"):
         if user_id != ADMIN_ID:
             temporary_message(
@@ -422,17 +368,15 @@ def handle_message(message):
             )
             return
 
-        remove_id = int(parts[1])
-        authorized_users.discard(remove_id)
+        authorized_users.discard(int(parts[1]))
 
         temporary_message(
             chat_id,
-            f"✅ User-এর অনুমতি বাতিল হয়েছে: {remove_id}",
+            "✅ User-এর অনুমতি বাতিল হয়েছে।",
             seconds=10
         )
         return
 
-    # Authorization
     if user_id not in authorized_users and user_id != ADMIN_ID:
         if text == current_secret:
             authorized_users.add(user_id)
@@ -448,11 +392,9 @@ def handle_message(message):
                 "❌ Secret Code ভুল।",
                 seconds=10
             )
-
         return
 
-    # Link
-    url = get_url(text)
+    url = extract_url(text)
 
     if not url:
         temporary_message(
@@ -479,12 +421,7 @@ def handle_message(message):
 
     threading.Thread(
         target=process_download,
-        args=(
-            chat_id,
-            message_id,
-            url,
-            status_id
-        ),
+        args=(chat_id, message_id, url, status_id),
         daemon=True
     ).start()
 
@@ -492,7 +429,6 @@ def handle_message(message):
 def polling():
     print("Polling started...")
 
-    # পুরোনো webhook মুছে ফেলা
     tg(
         "deleteWebhook",
         {
@@ -521,7 +457,7 @@ def polling():
             data = response.json()
 
             if not data.get("ok"):
-                print("GetUpdates error:", data)
+                print("Polling error:", data)
                 time.sleep(5)
                 continue
 
@@ -535,7 +471,7 @@ def polling():
                 ).start()
 
         except Exception as error:
-            print("Polling error:", error)
+            print("Polling exception:", error)
             time.sleep(5)
 
 
@@ -555,9 +491,7 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    port = int(os.getenv("PORT", "10000"))
-
     app.run(
         host="0.0.0.0",
-        port=port
-            )
+        port=int(os.getenv("PORT", "10000"))
+    )
